@@ -39,15 +39,6 @@ async def _check_cnki_accessible(page: Page) -> None:
             "CNKI 访问被 CDN 拦截（TencentEdgeOne）。"
             "当前 IP 可能被 CNKI 限制了访问，请尝试更换网络环境或使用代理。"
         )
-
-
-async def human_type(page: Page, selector: str, text: str) -> None:
-    """模拟人类逐字符输入"""
-    loc = page.locator(selector)
-    await loc.clear()
-    await loc.press_sequentially(text, delay=random.uniform(30, 80))
-
-
 async def select_search_type(page: Page, search_type: str) -> bool:
     """在 CNKI 首页选择搜索类型（如 主题→关键词）"""
     value = SEARCH_TYPE_VALUES.get(search_type)
@@ -95,9 +86,9 @@ async def submit_search(page: Page) -> None:
     await asyncio.sleep(0.3)
 
     try:
-        search_btn = page.locator(SELECTOR_SEARCH_BTN)
-        if await search_btn.count() > 0:
-            await search_btn.evaluate("el => el.click()")
+        search_btn = page.locator(SELECTOR_SEARCH_BTN).first
+        if await search_btn.count() > 0 and await search_btn.is_visible():
+            await search_btn.click()
             return
     except Exception:
         pass
@@ -143,14 +134,26 @@ async def parse_paper_row_async(row) -> dict[str, Any]:
         paper["date"] = ""
 
     try:
+        # CNKI 可能通过 JS 动态加载引用次数，先尝试 td.quote 内的链接
         cite_el = row.locator("td.quote a").first
-        paper["cited_count"] = ((await cite_el.text_content()) or "0").strip() if await cite_el.count() > 0 else "0"
+        if await cite_el.count() > 0:
+            paper["cited_count"] = ((await cite_el.text_content()) or "0").strip()
+        else:
+            # 回退：直接取 td.quote 文本
+            cite_td = row.locator("td.quote").first
+            text = ((await cite_td.text_content()) or "").strip() if await cite_td.count() > 0 else ""
+            paper["cited_count"] = text if text else "0"
     except Exception:
         paper["cited_count"] = "0"
 
     try:
-        dl_el = row.locator("td.download a").first
-        paper["download_count"] = ((await dl_el.text_content()) or "0").strip() if await dl_el.count() > 0 else "0"
+        # CNKI 新页面结构：下载次数在 td.download > div > a.downloadCnt 中
+        dl_el = row.locator("td.download a.downloadCnt").first
+        if await dl_el.count() > 0:
+            paper["download_count"] = ((await dl_el.text_content()) or "0").strip()
+        else:
+            dl_el = row.locator("td.download a").first
+            paper["download_count"] = ((await dl_el.text_content()) or "0").strip() if await dl_el.count() > 0 else "0"
     except Exception:
         paper["download_count"] = "0"
 
@@ -179,9 +182,25 @@ async def search_cnki_impl(
 
     search_box = page.locator(SELECTOR_SEARCH_INPUT)
     await search_box.wait_for(timeout=15_000)
-    await human_type(page, SELECTOR_SEARCH_INPUT, query)
+    await search_box.fill(query)
+    await asyncio.sleep(random.uniform(0.3, 0.6))
     await submit_search(page)
-    await asyncio.sleep(random.uniform(2, 3))
+    await asyncio.sleep(random.uniform(3, 5))
+
+    # 检测是否触发验证码
+    current_url = page.url
+    if "verify" in current_url:
+        return {
+            "isError": True,
+            "error": "CNKI 触发了验证码，请稍后再试或手动完成验证",
+            "error_type": "CaptchaError",
+            "query": query,
+            "search_type": resolved_type,
+            "sort": resolved_sort,
+            "total_pages": pages,
+            "total_papers": 0,
+            "papers": [],
+        }
 
     if resolved_sort != "相关度":
         await apply_sort(page, resolved_sort)
@@ -192,13 +211,19 @@ async def search_cnki_impl(
             rows = page.locator(SELECTOR_RESULT_ROWS)
             count = await rows.count()
             for i in range(count):
-                row = rows.nth(i)
-                paper = await parse_paper_row_async(row)
-                if paper.get("title"):
-                    paper["page"] = page_num
-                    all_papers.append(paper)
-        except (PlaywrightTimeout, Exception):
-            pass
+                try:
+                    row = rows.nth(i)
+                    paper = await parse_paper_row_async(row)
+                    if paper.get("title"):
+                        paper["page"] = page_num
+                        all_papers.append(paper)
+                except Exception:
+                    pass  # 单行解析失败不影响其他行
+        except PlaywrightTimeout:
+            pass  # 超时说明没有更多结果，正常结束
+        except Exception as e:
+            import logging
+            logging.getLogger("cnki").warning(f"搜索页面 {page_num} 解析异常: {e}")
 
         if page_num < pages:
             try:

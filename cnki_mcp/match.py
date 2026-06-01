@@ -10,8 +10,8 @@ from typing import Any
 
 from playwright.async_api import Page
 
-from cnki_mcp.search import dismiss_popups, human_type, submit_search
-from cnki_mcp.config import SELECTOR_SEARCH_INPUT, SELECTOR_TITLE_LINK
+from cnki_mcp.search import dismiss_popups
+from cnki_mcp.config import SELECTOR_SEARCH_INPUT, SELECTOR_SEARCH_BTN, SELECTOR_RESULT_ROWS, SELECTOR_TITLE_LINK
 
 
 def find_closest_title(query: str, titles: list[str]) -> int:
@@ -34,24 +34,48 @@ async def find_best_match_impl(page: Page, query: str) -> dict[str, Any]:
 
     search_box = page.locator(SELECTOR_SEARCH_INPUT)
     await search_box.wait_for(timeout=15_000)
-    await human_type(page, SELECTOR_SEARCH_INPUT, query)
-    await submit_search(page)
-    await asyncio.sleep(random.uniform(2, 3))
+    await search_box.fill(query)
+    await asyncio.sleep(random.uniform(0.3, 0.6))
+
+    # 使用原生点击提交搜索
+    try:
+        search_btn = page.locator(SELECTOR_SEARCH_BTN).first
+        if await search_btn.count() > 0 and await search_btn.is_visible():
+            await search_btn.click()
+    except Exception:
+        await page.locator(SELECTOR_SEARCH_INPUT).press("Enter")
+
+    await asyncio.sleep(random.uniform(3, 5))
+
+    # 检测验证码
+    current_url = page.url
+    if "verify" in current_url:
+        return {
+            "query": query,
+            "best_match": None,
+            "isError": True,
+            "error": "CNKI 触发了验证码，请稍后再试",
+            "error_type": "CaptchaError",
+        }
 
     result_titles: list[str] = []
     result_urls: list[str] = []
 
     try:
-        await page.wait_for_selector(SELECTOR_TITLE_LINK, timeout=15_000)
-        links = page.locator(SELECTOR_TITLE_LINK)
-        count = await links.count()
+        await page.wait_for_selector(SELECTOR_RESULT_ROWS, timeout=15_000)
+        rows = page.locator(SELECTOR_RESULT_ROWS)
+        count = await rows.count()
         for i in range(count):
-            link = links.nth(i)
-            text = (await link.text_content() or "").strip()
-            href = (await link.get_attribute("href")) or ""
-            if text:
-                result_titles.append(text)
-                result_urls.append(href)
+            try:
+                title_el = rows.nth(i).locator(SELECTOR_TITLE_LINK).first
+                if await title_el.count() > 0:
+                    text = (await title_el.text_content() or "").strip()
+                    href = (await title_el.get_attribute("href")) or ""
+                    if text:
+                        result_titles.append(text)
+                        result_urls.append(href)
+            except Exception:
+                pass
     except Exception:
         pass
 
