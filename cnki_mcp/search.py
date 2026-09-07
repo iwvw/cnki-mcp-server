@@ -2,26 +2,33 @@
 CNKI 论文搜索核心逻辑。
 
 从 Selenium 迁移到 Playwright，保留相同的搜索/翻页/排序/弹窗处理策略。
+行级解析已抽为纯函数（parsing.parse_paper_row_html），不再依赖脆弱的 CSS 选择器。
 """
 
 import asyncio
+import logging
 import random
 from typing import Any
 
-from playwright.async_api import Page, TimeoutError as PlaywrightTimeout
+from playwright.async_api import Page
+from playwright.async_api import TimeoutError as PlaywrightTimeout
 
 from cnki_mcp.config import (
+    CNKI_HOME_URL,
     SEARCH_TYPE_VALUES,
+    SELECTOR_NEXT_PAGE,
     SELECTOR_RESULT_ROWS,
     SELECTOR_SEARCH_BTN,
     SELECTOR_SEARCH_INPUT,
     SELECTOR_SEARCH_TYPE_DROPDOWN,
     SELECTOR_SEARCH_TYPE_LIST,
-    SELECTOR_NEXT_PAGE,
     SORT_TYPES,
 )
 from cnki_mcp.exceptions import SearchError
+from cnki_mcp.parsing import filter_papers, parse_paper_row_html
 from cnki_mcp.utils import dismiss_popups, resolve_search_type, resolve_sort_type
+
+logger = logging.getLogger("cnki")
 
 
 async def _check_cnki_accessible(page: Page) -> None:
@@ -34,11 +41,33 @@ async def _check_cnki_accessible(page: Page) -> None:
             "请检查网络环境，或尝试设置 CNKI_PROXY 环境变量更换代理 IP。"
         )
     # TencentEdgeOne CDN 拦截特征
-    if "TencentEdgeOne" in content and "set-cookie" in content.lower():
+    lowered = content.lower()
+    if "tencentedgeone" in lowered and "set-cookie" in lowered:
         raise SearchError(
             "CNKI 访问被 CDN 拦截（TencentEdgeOne）。"
             "当前 IP 可能被 CNKI 限制了访问，请尝试更换网络环境或使用代理。"
         )
+    # 滑块验证码特征（页面标题包含 verify 或出现滑块组件）
+    if "verify" in page.url.lower() or "nc_scale" in lowered and "滑动" in content:
+        raise SearchError(
+            "CNKI 触发了滑块验证码。请稍后重试，或先用浏览器手动访问 https://www.cnki.net/ 完成验证。"
+        )
+
+
+async def _goto_home_with_retry(page: Page, retries: int = 2) -> None:
+    """导航到 CNKI 首页并做可访问性检查；网络波动或反爬拦截时自动重试。"""
+    for attempt in range(retries + 1):
+        try:
+            await page.goto(CNKI_HOME_URL, wait_until="domcontentloaded", timeout=30_000)
+            await asyncio.sleep(random.uniform(1, 2))
+            await dismiss_popups(page)
+            await _check_cnki_accessible(page)
+            return
+        except SearchError:
+            if attempt >= retries:
+                raise
+            logger.warning("CNKI 首页加载异常，第 %s 次重试", attempt + 1)
+            await asyncio.sleep(random.uniform(2, 3))
 async def select_search_type(page: Page, search_type: str) -> bool:
     """在 CNKI 首页选择搜索类型（如 主题→关键词）"""
     value = SEARCH_TYPE_VALUES.get(search_type)
@@ -100,64 +129,13 @@ async def submit_search(page: Page) -> None:
 
 
 async def parse_paper_row_async(row) -> dict[str, Any]:
-    """从 Playwright Locator 元素中提取论文信息"""
-    paper: dict[str, Any] = {}
-
+    """从 Playwright 行元素提取论文信息（委托给纯函数解析器）"""
     try:
-        title_el = row.locator("a.fz14").first
-        if await title_el.count() > 0:
-            paper["title"] = (await title_el.text_content() or "").strip()
-            paper["url"] = (await title_el.get_attribute("href")) or ""
-        else:
-            paper["title"] = ""
-            paper["url"] = ""
+        html = await row.inner_html()
     except Exception:
-        paper["title"] = ""
-        paper["url"] = ""
-
-    try:
-        author_els = await row.locator("td.author a").all()
-        paper["authors"] = [(await a.text_content() or "").strip() for a in author_els]
-    except Exception:
-        paper["authors"] = []
-
-    try:
-        source_el = row.locator("td.source a").first
-        paper["source"] = ((await source_el.text_content()) or "").strip() if await source_el.count() > 0 else ""
-    except Exception:
-        paper["source"] = ""
-
-    try:
-        date_el = row.locator("td.date").first
-        paper["date"] = ((await date_el.text_content()) or "").strip() if await date_el.count() > 0 else ""
-    except Exception:
-        paper["date"] = ""
-
-    try:
-        # CNKI 可能通过 JS 动态加载引用次数，先尝试 td.quote 内的链接
-        cite_el = row.locator("td.quote a").first
-        if await cite_el.count() > 0:
-            paper["cited_count"] = ((await cite_el.text_content()) or "0").strip()
-        else:
-            # 回退：直接取 td.quote 文本
-            cite_td = row.locator("td.quote").first
-            text = ((await cite_td.text_content()) or "").strip() if await cite_td.count() > 0 else ""
-            paper["cited_count"] = text if text else "0"
-    except Exception:
-        paper["cited_count"] = "0"
-
-    try:
-        # CNKI 新页面结构：下载次数在 td.download > div > a.downloadCnt 中
-        dl_el = row.locator("td.download a.downloadCnt").first
-        if await dl_el.count() > 0:
-            paper["download_count"] = ((await dl_el.text_content()) or "0").strip()
-        else:
-            dl_el = row.locator("td.download a").first
-            paper["download_count"] = ((await dl_el.text_content()) or "0").strip() if await dl_el.count() > 0 else "0"
-    except Exception:
-        paper["download_count"] = "0"
-
-    return paper
+        return {"title": "", "url": "", "authors": [], "source": "",
+                "date": "", "cited_count": "0", "download_count": "0"}
+    return parse_paper_row_html(html)
 
 
 async def search_cnki_impl(
@@ -166,16 +144,20 @@ async def search_cnki_impl(
     search_type: str = "主题",
     pages: int = 1,
     sort: str = "相关度",
+    year_from: int | None = None,
+    year_to: int | None = None,
+    journals: list[str] | None = None,
 ) -> dict[str, Any]:
-    """执行 CNKI 搜索并返回结果列表"""
+    """执行 CNKI 搜索并返回结果列表
+
+    year_from/year_to: 按日期列年份做结果侧过滤（取不到年份的论文保留）。
+    journals: 期刊名单过滤（大小写不敏感，子串匹配）。
+    """
     resolved_type = resolve_search_type(search_type)
     resolved_sort = resolve_sort_type(sort)
     all_papers: list[dict[str, Any]] = []
 
-    await page.goto("https://www.cnki.net/", wait_until="domcontentloaded")
-    await asyncio.sleep(random.uniform(1, 2))
-    await dismiss_popups(page)
-    await _check_cnki_accessible(page)
+    await _goto_home_with_retry(page)
 
     if resolved_type != "主题":
         await select_search_type(page, resolved_type)
@@ -187,9 +169,9 @@ async def search_cnki_impl(
     await submit_search(page)
     await asyncio.sleep(random.uniform(3, 5))
 
-    # 检测是否触发验证码
-    current_url = page.url
-    if "verify" in current_url:
+    # 检测是否触发验证码（URL 特征优先，再做内容级反爬检查）
+    if "verify" in page.url:
+        logger.warning("搜索触发验证码: %s", query)
         return {
             "isError": True,
             "error": "CNKI 触发了验证码，请稍后再试或手动完成验证",
@@ -222,8 +204,7 @@ async def search_cnki_impl(
         except PlaywrightTimeout:
             pass  # 超时说明没有更多结果，正常结束
         except Exception as e:
-            import logging
-            logging.getLogger("cnki").warning(f"搜索页面 {page_num} 解析异常: {e}")
+            logger.warning("搜索页面 %s 解析异常: %s", page_num, e)
 
         if page_num < pages:
             try:
@@ -236,6 +217,12 @@ async def search_cnki_impl(
             except Exception:
                 break
 
+    before = len(all_papers)
+    if year_from is not None or year_to is not None or journals:
+        all_papers = filter_papers(all_papers, year_from=year_from, year_to=year_to, journal_names=journals)
+        if len(all_papers) < before:
+            logger.info("结果侧过滤: %d -> %d 篇", before, len(all_papers))
+
     return {
         "query": query,
         "search_type": resolved_type,
@@ -243,4 +230,9 @@ async def search_cnki_impl(
         "total_pages": pages,
         "total_papers": len(all_papers),
         "papers": all_papers,
+        "filters": {
+            "year_from": year_from,
+            "year_to": year_to,
+            "journals": journals or [],
+        },
     }

@@ -15,19 +15,28 @@ import random
 import subprocess
 import sys
 import time
-from typing import Optional
 
 from playwright.async_api import Browser, BrowserContext, Page, async_playwright
 
 from cnki_mcp.config import (
     BROWSER_TIMEOUT,
     IDLE_TIMEOUT,
+    NAVIGATION_TIMEOUT,
     USER_AGENTS,
 )
 from cnki_mcp.exceptions import BrowserError
 
+# 弹窗/遮罩关闭选择器（与 utils.dismiss_popups 保持一致）
+dismiss_selectors = [
+    "#close",
+    ".close",
+    'div[class*="popup"] a:has-text("关闭")',
+    'div[class*="modal"] button:has-text("关闭")',
+    'div[class*="layui-layer"] a[class*="layui-layer-close"]',
+]
 
-def _get_proxy_settings() -> Optional[dict]:
+
+def _get_proxy_settings() -> dict | None:
     """从环境变量读取代理配置，返回 Playwright proxy 字典"""
     proxy_url = (
         os.environ.get("CNKI_PROXY")
@@ -70,10 +79,7 @@ def _parse_no_proxy(no_proxy: str) -> list[str]:
             continue
         entry = entry.lstrip(".")
         # 已经是带通配符的 glob，直接使用
-        if "*" in entry:
-            patterns.append(entry)
-        # IP 地址或 CIDR，直接使用
-        elif entry[0].isdigit():
+        if "*" in entry or entry[0].isdigit():
             patterns.append(entry)
         # 域名，添加 * 前缀匹配所有子域
         else:
@@ -86,8 +92,8 @@ class AsyncBrowserPool:
 
     def __init__(self) -> None:
         self._playwright = None
-        self._browser: Optional[Browser] = None
-        self._context: Optional[BrowserContext] = None
+        self._browser: Browser | None = None
+        self._context: BrowserContext | None = None
         self._last_used: float = 0
         self._lock = asyncio.Lock()
 
@@ -176,27 +182,35 @@ class AsyncBrowserPool:
         assert self._context is not None
         page = await self._context.new_page()
         page.set_default_timeout(BROWSER_TIMEOUT)
+        page.set_default_navigation_timeout(NAVIGATION_TIMEOUT)
         return page
 
     async def navigate_to_cnki(self, page: Page) -> None:
-        """导航到 CNKI 首页（含弹窗处理）"""
-        await page.goto("https://www.cnki.net/", wait_until="domcontentloaded")
-        await asyncio.sleep(random.uniform(1, 2))
-        await self._dismiss_popups(page)
+        """导航到 CNKI 首页（含弹窗处理与网络重试）"""
+        for attempt in range(3):
+            try:
+                await page.goto(
+                    "https://www.cnki.net/",
+                    wait_until="domcontentloaded",
+                    timeout=NAVIGATION_TIMEOUT,
+                )
+                await asyncio.sleep(random.uniform(1, 2))
+                await self._dismiss_popups(page)
+                return
+            except Exception:
+                if attempt >= 2:
+                    raise
+                await asyncio.sleep(random.uniform(2, 3))
 
     async def _dismiss_popups(self, page: Page) -> bool:
         """尝试关闭 CNKI 弹窗/遮罩"""
-        dismiss_selectors = [
-            "#close",
-            ".close",
-            'div[class*="popup"] a:has-text("关闭")',
-            'div[class*="modal"] button:has-text("关闭")',
-            'div[class*="layui-layer"] a[class*="layui-layer-close"]',
-        ]
         for selector in dismiss_selectors:
             try:
-                elem = page.locator(selector).first
-                if await elem.count() > 0 and await elem.is_visible():
+                loc = page.locator(selector)
+                if await loc.count() == 0:
+                    continue
+                elem = loc.first
+                if await elem.is_visible():
                     await elem.click()
                     await asyncio.sleep(0.5)
                     return True

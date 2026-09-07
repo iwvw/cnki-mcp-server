@@ -8,9 +8,11 @@ import asyncio
 import random
 from typing import Any
 
-from playwright.async_api import Page, TimeoutError as PlaywrightTimeout
+from playwright.async_api import Page
+from playwright.async_api import TimeoutError as PlaywrightTimeout
 
 from cnki_mcp.exceptions import DetailError
+from cnki_mcp.parsing import parse_publication_info
 
 
 async def get_paper_detail_impl(page: Page, url: str) -> dict[str, Any]:
@@ -128,23 +130,19 @@ async def get_paper_detail_impl(page: Page, url: str) -> dict[str, Any]:
     except Exception:
         pass
 
-    # 年/卷/期/页 — 遍历 top-tip 中所有 span 查找逗号分隔的出版信息
+    # 年/卷/期/页 — 遍历 top-tip 中所有 span，命中含年份的出版信息文本即解析
+    # 兼容 "2022, 45(3): 1-15" / "2025(3): 1-15" / "2025: 1-15" 等多种形态
     try:
         spans = page.locator("div.top-tip span")
         cnt = await spans.count()
         for i in range(cnt):
             text = (await spans.nth(i).text_content() or "").strip()
-            # 匹配 "2022, 45(3): 1-15" 这样的模式
-            if "," in text and any(c.isdigit() for c in text):
-                parts = text.split(",")
-                paper["year"] = parts[0].strip()
-                if len(parts) > 1:
-                    rest = parts[1].strip()
-                    if "(" in rest and ")" in rest:
-                        paper["volume"] = rest.split("(")[0].strip()
-                        paper["issue"] = rest.split("(")[1].split(")")[0].strip()
-                    if ":" in rest:
-                        paper["pages"] = rest.split(":")[-1].strip()
+            info = parse_publication_info(text)
+            if info["year"] and not paper["year"]:
+                paper["year"] = info["year"]
+                paper["volume"] = info["volume"]
+                paper["issue"] = info["issue"]
+                paper["pages"] = info["pages"]
                 break
     except Exception:
         pass

@@ -20,13 +20,14 @@ from fastmcp import Context, FastMCP
 from fastmcp.dependencies import CurrentContext
 from pydantic import Field
 
+from cnki_mcp import __version__
 from cnki_mcp.browser import AsyncBrowserPool
 from cnki_mcp.citation import format_citation_impl
-from cnki_mcp.config import SEARCH_TYPES, SEARCH_TYPE_ALIASES
+from cnki_mcp.config import SEARCH_TYPE_ALIASES, SEARCH_TYPES
 from cnki_mcp.detail import get_paper_detail_impl
-from cnki_mcp.exceptions import CNKIError, CitationError, ExportError
+from cnki_mcp.exceptions import CitationError, CNKIError, ExportError
 from cnki_mcp.export import export_papers_impl
-from cnki_mcp.journals import list_categories_impl, search_journals_impl, recent_articles_impl
+from cnki_mcp.journals import list_categories_impl, recent_articles_impl, search_journals_impl
 from cnki_mcp.match import find_best_match_impl
 from cnki_mcp.search import search_cnki_impl
 
@@ -65,6 +66,8 @@ CNKI (中国知网) 论文检索 MCP 服务器。
 - sort: 排序方式（可选，默认"相关度"）
   - 支持: 相关度、发表时间、被引、下载、综合
   - 英文别名: relevance, date, cited, download, composite
+- year_from / year_to: 发表年份区间过滤（可选，结果侧过滤）
+- journals: 期刊名单过滤（可选，如 ["管理世界", "经济研究"]，大小写不敏感）
 
 ### get_paper_detail
 获取论文详情页的完整信息。
@@ -120,9 +123,22 @@ async def search_cnki(
     sort: Annotated[str, Field(
         description="排序方式: 相关度、发表时间、被引、下载、综合 (英文: relevance, date, cited, download, composite)"
     )] = "相关度",
+    year_from: Annotated[int | None, Field(
+        description="发表年份下限（含），可选",
+        ge=1900,
+        le=2100,
+    )] = None,
+    year_to: Annotated[int | None, Field(
+        description="发表年份上限（含），可选",
+        ge=1900,
+        le=2100,
+    )] = None,
+    journals: Annotated[list[str] | None, Field(
+        description="期刊名单过滤（大小写不敏感，子串匹配），可选",
+    )] = None,
 ) -> dict:
     """
-    搜索 CNKI 论文，返回论文列表。
+    搜索 CNKI 论文，返回论文列表（可按年份区间与期刊名单过滤）。
 
     Args:
         query: 搜索关键词
@@ -130,6 +146,9 @@ async def search_cnki(
         search_type: 搜索类型，支持中英文
         pages: 搜索页数（1-10），每页约20条结果
         sort: 排序方式
+        year_from: 发表年份下限（含）
+        year_to: 发表年份上限（含）
+        journals: 期刊名单过滤
 
     Returns:
         包含论文列表的字典
@@ -140,7 +159,10 @@ async def search_cnki(
     pool = _get_pool(ctx)
     page = await pool.new_page()
     try:
-        result = await search_cnki_impl(page, query, search_type, pages, sort)
+        result = await search_cnki_impl(
+            page, query, search_type, pages, sort,
+            year_from=year_from, year_to=year_to, journals=journals,
+        )
     except CNKIError as e:
         result = {"isError": True, "error": str(e), "error_type": type(e).__name__, "papers": []}
         await ctx.error(f"搜索失败: {e}")
@@ -399,7 +421,7 @@ async def get_server_status(ctx: Context) -> str:
     """返回服务器状态信息"""
     return json.dumps({
         "server_name": "CNKI 论文检索服务",
-        "version": "0.2.0",
+        "version": __version__,
         "engine": "Playwright",
         "features": [
             "浏览器池复用",
@@ -407,7 +429,9 @@ async def get_server_status(ctx: Context) -> str:
             "async/await 原生异步",
             "独立 Page 会话隔离",
             "反检测脚本注入",
-            "Playwright 自动等待",
+            "首页导航自动重试",
+            "纯函数 HTML 解析（可单测）",
+            "结果侧年份/期刊名单过滤",
         ],
         "tools": [
             "search_cnki", "get_paper_detail", "find_best_match",

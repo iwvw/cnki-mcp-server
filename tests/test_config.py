@@ -2,10 +2,10 @@
 """
 
 from cnki_mcp.config import (
-    SEARCH_TYPES,
     SEARCH_TYPE_ALIASES,
-    SORT_TYPES,
+    SEARCH_TYPES,
     SORT_TYPE_ALIASES,
+    SORT_TYPES,
 )
 
 

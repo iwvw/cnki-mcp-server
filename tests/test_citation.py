@@ -3,12 +3,12 @@
 import pytest
 
 from cnki_mcp.citation import (
-    format_citation_impl,
     SUPPORTED_STYLES,
-    format_gbt7714,
     format_apa,
-    format_mla,
     format_chicago,
+    format_citation_impl,
+    format_gbt7714,
+    format_mla,
     format_vancouver,
 )
 from cnki_mcp.exceptions import CitationError

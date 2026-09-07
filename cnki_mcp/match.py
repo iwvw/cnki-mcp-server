@@ -1,36 +1,34 @@
 """
 CNKI 论文标题快速匹配。
 
-使用字符匹配算法，适合验证论文标题或快速定位特定论文。
+使用 difflib 序列匹配算法（比字符计数更接近人类判断），
+适合验证论文标题或快速定位特定论文。
 """
 
 import asyncio
 import random
+from difflib import SequenceMatcher
 from typing import Any
 
 from playwright.async_api import Page
 
-from cnki_mcp.search import dismiss_popups
-from cnki_mcp.config import SELECTOR_SEARCH_INPUT, SELECTOR_SEARCH_BTN, SELECTOR_RESULT_ROWS, SELECTOR_TITLE_LINK
+from cnki_mcp.config import SELECTOR_RESULT_ROWS, SELECTOR_SEARCH_BTN, SELECTOR_SEARCH_INPUT
+from cnki_mcp.search import _check_cnki_accessible, _goto_home_with_retry, parse_paper_row_async
 
 
 def find_closest_title(query: str, titles: list[str]) -> int:
-    """根据字符匹配度选择最接近的搜索结果"""
-    max_similar = 0
-    best_index = 0
-    for i, title in enumerate(titles):
-        common_chars = sum(c in title for c in query)
-        if common_chars > max_similar:
-            max_similar = common_chars
-            best_index = i
-    return best_index
+    """根据序列匹配度选择最接近的搜索结果，返回下标"""
+    if not titles:
+        return 0
+    return max(
+        range(len(titles)),
+        key=lambda i: SequenceMatcher(None, query, titles[i]).ratio(),
+    )
 
 
 async def find_best_match_impl(page: Page, query: str) -> dict[str, Any]:
     """搜索并返回最匹配论文的标题和 URL"""
-    await page.goto("https://www.cnki.net/", wait_until="domcontentloaded")
-    await asyncio.sleep(random.uniform(1, 2))
-    await dismiss_popups(page)
+    await _goto_home_with_retry(page)
 
     search_box = page.locator(SELECTOR_SEARCH_INPUT)
     await search_box.wait_for(timeout=15_000)
@@ -47,9 +45,8 @@ async def find_best_match_impl(page: Page, query: str) -> dict[str, Any]:
 
     await asyncio.sleep(random.uniform(3, 5))
 
-    # 检测验证码
-    current_url = page.url
-    if "verify" in current_url:
+    # 检测验证码（URL 特征优先，再做内容级反爬检查）
+    if "verify" in page.url:
         return {
             "query": query,
             "best_match": None,
@@ -57,6 +54,7 @@ async def find_best_match_impl(page: Page, query: str) -> dict[str, Any]:
             "error": "CNKI 触发了验证码，请稍后再试",
             "error_type": "CaptchaError",
         }
+    await _check_cnki_accessible(page)
 
     result_titles: list[str] = []
     result_urls: list[str] = []
@@ -67,13 +65,10 @@ async def find_best_match_impl(page: Page, query: str) -> dict[str, Any]:
         count = await rows.count()
         for i in range(count):
             try:
-                title_el = rows.nth(i).locator(SELECTOR_TITLE_LINK).first
-                if await title_el.count() > 0:
-                    text = (await title_el.text_content() or "").strip()
-                    href = (await title_el.get_attribute("href")) or ""
-                    if text:
-                        result_titles.append(text)
-                        result_urls.append(href)
+                paper = await parse_paper_row_async(rows.nth(i))
+                if paper.get("title"):
+                    result_titles.append(paper["title"])
+                    result_urls.append(paper["url"])
             except Exception:
                 pass
     except Exception:

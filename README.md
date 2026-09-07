@@ -24,6 +24,13 @@
 
 相关度 / 发表时间 / 被引 / 下载 / 综合（支持英文别名：relevance, date, cited, download, composite）。
 
+### 结果过滤（v0.3.0 新增）
+
+`search_cnki` 支持在搜索后做结果侧过滤：
+
+- `year_from` / `year_to`: 发表年份区间（含边界），对结果列表的日期列提取年份；提取不到年份的论文保留。
+- `journals`: 期刊名单过滤，大小写不敏感、子串匹配（传「管理世界」可匹配「管理世界(半月刊)」）。
+
 ## 安装
 
 ```bash
@@ -262,6 +269,10 @@ python -m cnki_mcp
 - **并发**: 原生 async/await
 - **反检测**: 随机 User-Agent、模拟人类输入、navigator.webdriver 覆写
 - **会话复用**: 共享 BrowserContext，Cookie 互通，避免 CNKI 验证码
+- **行级解析** (v0.3.0): 搜索结果行解析抽为纯函数模块 `parsing.py`（标准库 HTMLParser），
+  不依赖脆弱的选择器，便于单元测试；URL 相对路径自动补全为 `https://kns.cnki.net/...`
+- **健壮性** (v0.3.0): 首页导航失败自动重试（2 次）；验证码检测升级为「URL + 页面内容」双特征；
+  标题匹配改用 difflib 序列匹配，替代原字符计数算法
 
 ## 开发
 
