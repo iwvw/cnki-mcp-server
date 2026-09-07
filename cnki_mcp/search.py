@@ -48,9 +48,10 @@ async def _check_cnki_accessible(page: Page) -> None:
             "当前 IP 可能被 CNKI 限制了访问，请尝试更换网络环境或使用代理。"
         )
     # 滑块验证码特征（页面标题包含 verify 或出现滑块组件）
-    if "verify" in page.url.lower() or "nc_scale" in lowered and "滑动" in content:
+    if "verify" in page.url.lower() or ("nc_scale" in lowered and "滑动" in content):
         raise SearchError(
-            "CNKI 触发了滑块验证码。请稍后重试，或先用浏览器手动访问 https://www.cnki.net/ 完成验证。"
+            "CNKI 触发了滑块验证码。请稍后重试，"
+            "或先用浏览器手动访问 https://www.cnki.net/ 完成验证。"
         )
 
 
@@ -157,6 +158,20 @@ async def search_cnki_impl(
     resolved_sort = resolve_sort_type(sort)
     all_papers: list[dict[str, Any]] = []
 
+    async def _captcha_result() -> dict[str, Any]:
+        logger.warning("搜索触发验证码: %s", query)
+        return {
+            "isError": True,
+            "error": "CNKI 触发了验证码（安全验证），请稍后再试或手动完成验证",
+            "error_type": "CaptchaError",
+            "query": query,
+            "search_type": resolved_type,
+            "sort": resolved_sort,
+            "total_pages": pages,
+            "total_papers": 0,
+            "papers": [],
+        }
+
     await _goto_home_with_retry(page)
 
     if resolved_type != "主题":
@@ -169,20 +184,9 @@ async def search_cnki_impl(
     await submit_search(page)
     await asyncio.sleep(random.uniform(3, 5))
 
-    # 检测是否触发验证码（URL 特征优先，再做内容级反爬检查）
+    # 检测是否触发验证码（URL 特征优先；跳转有延迟，超时后还会复查一次）
     if "verify" in page.url:
-        logger.warning("搜索触发验证码: %s", query)
-        return {
-            "isError": True,
-            "error": "CNKI 触发了验证码，请稍后再试或手动完成验证",
-            "error_type": "CaptchaError",
-            "query": query,
-            "search_type": resolved_type,
-            "sort": resolved_sort,
-            "total_pages": pages,
-            "total_papers": 0,
-            "papers": [],
-        }
+        return await _captcha_result()
 
     if resolved_sort != "相关度":
         await apply_sort(page, resolved_sort)
@@ -202,7 +206,10 @@ async def search_cnki_impl(
                 except Exception:
                     pass  # 单行解析失败不影响其他行
         except PlaywrightTimeout:
-            pass  # 超时说明没有更多结果，正常结束
+            # 超时复核：可能已跳转到验证码页（跳转有延迟，提交后的即时检查可能漏掉）
+            if "verify" in page.url:
+                return await _captcha_result()
+            pass  # 其余情况说明没有更多结果，正常结束
         except Exception as e:
             logger.warning("搜索页面 %s 解析异常: %s", page_num, e)
 
@@ -219,7 +226,9 @@ async def search_cnki_impl(
 
     before = len(all_papers)
     if year_from is not None or year_to is not None or journals:
-        all_papers = filter_papers(all_papers, year_from=year_from, year_to=year_to, journal_names=journals)
+        all_papers = filter_papers(
+            all_papers, year_from=year_from, year_to=year_to, journal_names=journals,
+        )
         if len(all_papers) < before:
             logger.info("结果侧过滤: %d -> %d 篇", before, len(all_papers))
 

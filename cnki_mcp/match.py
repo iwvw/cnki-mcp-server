@@ -61,6 +61,19 @@ async def find_best_match_impl(page: Page, query: str) -> dict[str, Any]:
 
     try:
         await page.wait_for_selector(SELECTOR_RESULT_ROWS, timeout=15_000)
+    except Exception:
+        # 超时复核：可能已跳转到验证码页（跳转有延迟，提交后的即时检查可能漏掉）
+        if "verify" in page.url:
+            return {
+                "query": query,
+                "best_match": None,
+                "isError": True,
+                "error": "CNKI 触发了验证码，请稍后再试",
+                "error_type": "CaptchaError",
+            }
+        await _check_cnki_accessible(page)
+
+    try:
         rows = page.locator(SELECTOR_RESULT_ROWS)
         count = await rows.count()
         for i in range(count):
