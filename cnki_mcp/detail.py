@@ -2,10 +2,13 @@
 CNKI 论文详情页解析。
 
 从 Selenium 迁移到 Playwright，提取论文的全部元数据字段。
+采用「多候选选择器 + 全文兜底正则」策略：CNKI 详情页结构多变，
+任一候选命中即取，全部失败时回退到页面源码正则搜索。
 """
 
 import asyncio
 import random
+import re
 from typing import Any
 
 from playwright.async_api import Page
@@ -13,6 +16,83 @@ from playwright.async_api import TimeoutError as PlaywrightTimeout
 
 from cnki_mcp.exceptions import DetailError
 from cnki_mcp.parsing import parse_publication_info
+
+# 机构特征词：作者区混入的机构项会被过滤并归入 institutions
+_INSTITUTION_HINTS = ("大学", "学院", "研究院", "研究所", "研究中心", "科学院", "实验室",
+                      "公司", "银行", "医院", "中学", "小学", "党校", "支队", "总队", "委员会")
+
+# 标题尾部杂质（如 CNKI 的 "附视频" 标记）
+_TITLE_SUFFIX_PATTERN = re.compile(r"\s*(附视频|附音频|附附录|附更正)\s*$")
+
+# 详情页多候选选择器：新版结构变化时依次尝试
+_TITLE_SELECTORS = (".wx-tit h1", "h1")
+_TITLE_EN_SELECTORS = (".wx-tit h2",)
+_AUTHOR_SELECTORS = ("h3.author span a", "h3.author a", ".author span a", "h3.author a[href*='author']")
+_ORG_SELECTORS = ("h3.orgn span a", "h3.orgn a", ".orgn span a", "h3.orgn")
+_ABSTRACT_SELECTORS = ("#ChDivSummary", ".abstract-text", "div.abstract")
+_ABSTRACT_EN_SELECTORS = ("#EnChDivSummary",)
+_KEYWORDS_SELECTORS = ("p.keywords a", ".keywords a")
+_SOURCE_SELECTORS = ('div.top-tip a[href*="navi.cnki.net"]', 'a[href*="navi.cnki.net"]', ".top-tip a[href*='navi']")
+_PUBINFO_SELECTORS = ("div.top-tip span", ".top-tip span", ".journal-info span", ".head-info span")
+_DOI_SELECTORS = ("li.top-space", ".top-space", "li:has-text('DOI')")
+_CITED_SELECTORS = ("span#refs a", "#refs a", "span#refs")
+_DOWNLOAD_SELECTORS = ("span#DownLoadParts a", "#DownLoadParts a", "span#DownLoadParts")
+_FUND_SELECTORS = ('li:has-text("基金") p', "p.funds span", "li:has-text('基金')")
+_CLASS_SELECTORS = ('li:has-text("分类号") p', "li:has-text('分类号')")
+
+# 全文兜底正则
+_RE_YEAR_VOL_PAGES = re.compile(r"(20\d{2})[,，]?\s*(?:(\d+)\s*[\(（]\s*(\d+)\s*[\)）])?\s*[:：]\s*([0-9][0-9\-–~]+)")
+_RE_DOI = re.compile(r"DOI\s*[：:]\s*(10\.\d{4,}[^\s<\"']*)", re.IGNORECASE)
+_RE_CITED = re.compile(r"被引\s*[：:]?\s*(\d+)")
+_RE_DOWNLOAD = re.compile(r"下载(?:量)?\s*[：:]?\s*(\d+)")
+
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def _clean_text(text: str) -> str:
+    """去掉 HTML 标签与空白"""
+    return _HTML_TAG_RE.sub("", text or "").strip()
+
+
+async def _first_text(page: Page, selectors: tuple[str, ...]) -> str:
+    """依次尝试候选选择器，返回第一个命中的文本（空则 ''）"""
+    for sel in selectors:
+        try:
+            loc = page.locator(sel)
+            if await loc.count() > 0:
+                text = _clean_text(await loc.first.text_content())
+                if text:
+                    return text
+        except Exception:
+            continue
+    return ""
+
+
+async def _all_text(page: Page, selectors: tuple[str, ...]) -> list[str]:
+    """依次尝试候选选择器，返回第一个命中集合的全部文本"""
+    for sel in selectors:
+        try:
+            loc = page.locator(sel)
+            cnt = await loc.count()
+            if cnt > 0:
+                items = []
+                for i in range(cnt):
+                    t = _clean_text(await loc.nth(i).text_content())
+                    if t:
+                        items.append(t)
+                if items:
+                    return items
+        except Exception:
+            continue
+    return []
+
+
+async def _page_source(page: Page) -> str:
+    """读取页面源码（含动态加载内容）"""
+    try:
+        return await page.content()
+    except Exception:
+        return ""
 
 
 async def get_paper_detail_impl(page: Page, url: str) -> dict[str, Any]:
@@ -58,142 +138,114 @@ async def get_paper_detail_impl(page: Page, url: str) -> dict[str, Any]:
     except Exception as e:
         raise DetailError(f"页面导航失败: {e}") from e
 
+    source = await _page_source(page)
+    # 验证码页面特征：正文过短或含验证组件
+    if len(source) < 200 or "verifybox" in source or "安全验证" in source:
+        raise DetailError("CNKI 详情页触发了安全验证（滑块），请稍后重试")
+
     # 标题
-    try:
-        loc = page.locator(".wx-tit h1")
-        if await loc.count() > 0:
-            paper["title"] = (await loc.first.text_content() or "").strip()
-    except Exception:
-        pass
+    title = await _first_text(page, _TITLE_SELECTORS)
+    paper["title"] = _TITLE_SUFFIX_PATTERN.sub("", title).strip()
 
     # 英文标题
-    try:
-        loc = page.locator(".wx-tit h2")
-        if await loc.count() > 0:
-            paper["title_en"] = (await loc.first.text_content() or "").strip()
-    except Exception:
-        pass
+    paper["title_en"] = await _first_text(page, _TITLE_EN_SELECTORS)
 
-    # 作者
-    try:
-        author_els = await page.locator("h3.author span a").all()
-        paper["authors"] = [
-            (await a.text_content() or "").strip()
-            for a in author_els
-        ]
-    except Exception:
-        pass
+    # 作者（可能混入机构：过滤机构关键词归入 institutions）
+    authors = await _all_text(page, _AUTHOR_SELECTORS)
+    clean_authors, institutions = [], []
+    for name in authors:
+        if any(hint in name for hint in _INSTITUTION_HINTS):
+            institutions.append(name)
+        else:
+            clean_authors.append(name)
+    paper["authors"] = clean_authors
 
     # 机构
-    try:
-        org_els = await page.locator("h3.orgn span a").all()
-        paper["institutions"] = [
-            (await o.text_content() or "").strip()
-            for o in org_els
-        ]
-    except Exception:
-        pass
+    orgs = await _all_text(page, _ORG_SELECTORS)
+    if orgs:
+        # h3.orgn 整块文本时按空白/换行拆
+        paper["institutions"] = [o for o in orgs if any(hint in o for hint in _INSTITUTION_HINTS) or o]
+    paper["institutions"] = list(dict.fromkeys(institutions + paper["institutions"]))
 
-    # 摘要
-    try:
-        loc = page.locator("#ChDivSummary")
-        if await loc.count() > 0:
-            paper["abstract"] = (await loc.first.text_content() or "").strip()
-    except Exception:
-        pass
-
-    # 英文摘要
-    try:
-        loc = page.locator("#EnChDivSummary")
-        if await loc.count() > 0:
-            paper["abstract_en"] = (await loc.first.text_content() or "").strip()
-    except Exception:
-        pass
+    # 摘要 / 英文摘要
+    paper["abstract"] = await _first_text(page, _ABSTRACT_SELECTORS)
+    paper["abstract_en"] = await _first_text(page, _ABSTRACT_EN_SELECTORS)
 
     # 关键词
-    try:
-        kw_els = await page.locator("p.keywords a").all()
-        keywords = []
-        for k in kw_els:
-            text = (await k.text_content() or "").strip().rstrip(";；")
-            if text:
-                keywords.append(text)
-        paper["keywords"] = keywords
-    except Exception:
-        pass
+    keywords = await _all_text(page, _KEYWORDS_SELECTORS)
+    paper["keywords"] = [k.rstrip(";；,，") for k in keywords]
 
     # 来源
-    try:
-        loc = page.locator('div.top-tip a[href*="navi.cnki.net"]')
-        if await loc.count() > 0:
-            paper["source"] = (await loc.first.text_content() or "").strip().rstrip(" .")
-    except Exception:
-        pass
+    paper["source"] = (await _first_text(page, _SOURCE_SELECTORS)).rstrip(" .")
 
-    # 年/卷/期/页 — 遍历 top-tip 中所有 span，命中含年份的出版信息文本即解析
-    # 兼容 "2022, 45(3): 1-15" / "2025(3): 1-15" / "2025: 1-15" 等多种形态
-    try:
-        spans = page.locator("div.top-tip span")
-        cnt = await spans.count()
-        for i in range(cnt):
-            text = (await spans.nth(i).text_content() or "").strip()
-            info = parse_publication_info(text)
-            if info["year"] and not paper["year"]:
-                paper["year"] = info["year"]
-                paper["volume"] = info["volume"]
-                paper["issue"] = info["issue"]
-                paper["pages"] = info["pages"]
-                break
-    except Exception:
-        pass
+    # 年/卷/期/页：先候选选择器，再全文兜底
+    pub_found = False
+    for sel in _PUBINFO_SELECTORS:
+        try:
+            spans = page.locator(sel)
+            cnt = await spans.count()
+            for i in range(cnt):
+                text = _clean_text(await spans.nth(i).text_content())
+                info = parse_publication_info(text)
+                if info["year"]:
+                    paper["year"], paper["volume"], paper["issue"], paper["pages"] = (
+                        info["year"], info["volume"], info["issue"], info["pages"])
+                    pub_found = True
+                    break
+        except Exception:
+            continue
+        if pub_found:
+            break
+    if not pub_found:
+        m = _RE_YEAR_VOL_PAGES.search(source)
+        if m:
+            paper["year"] = m.group(1)
+            paper["volume"] = m.group(2) or ""
+            paper["issue"] = m.group(3) or ""
+            paper["pages"] = m.group(4) or ""
 
-    # DOI — 在 li.top-space 中查找包含 "DOI" 的项
-    try:
-        lis = page.locator("li.top-space")
-        cnt = await lis.count()
-        for i in range(cnt):
-            text = (await lis.nth(i).text_content() or "").strip()
-            if "DOI" in text:
-                # 提取 "DOI：10.xxx" 中的值
-                doi_val = text.replace("DOI", "").replace("：", "").replace(":", "").strip()
-                if doi_val:
-                    paper["doi"] = doi_val
-                break
-    except Exception:
-        pass
+    # DOI
+    doi = ""
+    for sel in _DOI_SELECTORS:
+        try:
+            loc = page.locator(sel)
+            cnt = await loc.count()
+            for i in range(cnt):
+                text = _clean_text(await loc.nth(i).text_content())
+                m = re.search(r"10\.\d{4,}[^\s\"']*", text)
+                if m:
+                    doi = m.group(0)
+                    break
+        except Exception:
+            continue
+        if doi:
+            break
+    if not doi:
+        m = _RE_DOI.search(source)
+        if m:
+            doi = m.group(1).strip()
+    paper["doi"] = doi
 
-    # 被引次数
-    try:
-        loc = page.locator("span#refs a")
-        if await loc.count() > 0:
-            paper["cited_count"] = (await loc.first.text_content() or "").strip()
-    except Exception:
-        pass
-
-    # 下载次数
-    try:
-        loc = page.locator("span#DownLoadParts a")
-        if await loc.count() > 0:
-            paper["download_count"] = (await loc.first.text_content() or "").strip()
-    except Exception:
-        pass
+    # 被引 / 下载
+    cited = await _first_text(page, _CITED_SELECTORS)
+    dl = await _first_text(page, _DOWNLOAD_SELECTORS)
+    if cited:
+        paper["cited_count"] = _clean_text(cited)
+    else:
+        m = _RE_CITED.search(source)
+        if m:
+            paper["cited_count"] = m.group(1)
+    if dl:
+        paper["download_count"] = _clean_text(dl)
+    else:
+        m = _RE_DOWNLOAD.search(source)
+        if m:
+            paper["download_count"] = m.group(1)
 
     # 基金
-    try:
-        loc = page.locator('li:has-text("基金") p')
-        if await loc.count() == 0:
-            loc = page.locator("p.funds span")
-        if await loc.count() > 0:
-            paper["fund"] = (await loc.first.text_content() or "").strip()
-    except Exception:
-        pass
+    paper["fund"] = (await _first_text(page, _FUND_SELECTORS)).rstrip("；;")
 
     # 分类号
-    try:
-        loc = page.locator('li:has-text("分类号") p')
-        if await loc.count() > 0:
-            paper["classification"] = (await loc.first.text_content() or "").strip()
-    except Exception:
-        pass
+    paper["classification"] = await _first_text(page, _CLASS_SELECTORS)
 
     return paper
