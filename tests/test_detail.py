@@ -1,6 +1,5 @@
 """测试 detail 模块的纯逻辑部分（清洗/作者机构分离/出版信息正则，无需浏览器）"""
 
-import re
 
 from cnki_mcp.detail import (
     _INSTITUTION_HINTS,

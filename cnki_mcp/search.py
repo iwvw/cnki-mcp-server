@@ -6,8 +6,10 @@ CNKI 论文搜索核心逻辑。
 """
 
 import asyncio
+import json
 import logging
 import random
+import re
 from typing import Any
 
 from playwright.async_api import Page
@@ -29,6 +31,111 @@ from cnki_mcp.parsing import filter_papers, parse_paper_row_html
 from cnki_mcp.utils import dismiss_popups, resolve_search_type, resolve_sort_type
 
 logger = logging.getLogger("cnki")
+
+# ============ grid API 检索（复用 gxlib-cnki 已验证的参数结构） ============
+# 外文检索的关键：Products 中第 11 位 CSCF(中文) → SCSF(外文)，Rlang=CHINESE/FOREIGN
+LANGUAGE_CONFIG = {
+    "中文": {"rlang": "CHINESE",
+            "products": "CJFQ,CAPJ,ZHYX,CJTL,CDFD,CMFD,WBFD,CPFD,IPFD,CCND,CSCF,SCHF,SCSD,SNAD,CCJD,CCVD,CJFN"},
+    "外文": {"rlang": "FOREIGN",
+            "products": "CJFQ,CAPJ,ZHYX,CJTL,CDFD,CMFD,WBFD,CPFD,IPFD,CCND,SCSF,SCHF,SCSD,SNAD,CCJD,CCVD,CJFN"},
+}
+LANGUAGE_ALIASES = {"chinese": "中文", "zh": "中文", "cn": "中文",
+                    "foreign": "外文", "en": "外文", "english": "外文", "外文": "外文", "英文": "外文"}
+CROSSIDS = ("YSTT4HG0,LSTPFY1C,EMRPGLPA,JUP3MUPD,MPMFIG1A,WQ0UVIAA,"
+            "BLZOG7CK,PWFIRAGL,NLBO1Z6R,NN3FJMUV")
+
+
+def resolve_language(language: str) -> str:
+    """解析检索语言，支持中英文别名，默认中文"""
+    if not language:
+        return "中文"
+    return LANGUAGE_ALIASES.get(language.lower().strip(), "中文")
+
+
+async def _search_via_api(
+    page: Page,
+    query: str,
+    search_type: str = "主题",
+    language: str = "中文",
+    year_from: int | None = None,
+    year_to: int | None = None,
+    sort: str = "相关度",
+    pages: int = 1,
+) -> list[dict[str, Any]]:
+    """通过 grid API 检索（page.evaluate fetch：同源、带完整 cookie 与浏览器指纹）。
+
+    外文检索走此路径：公开站首页 UI 没有外文入口，但底层 /kns8s/brief/grid
+    接口支持 Rlang=FOREIGN + SCSF products（与 gxlib-cnki 包库同构）。
+    """
+    field = SEARCH_TYPE_VALUES.get(search_type, "SU$%=|").split("$")[0]
+    lang_cfg = LANGUAGE_CONFIG.get(language, LANGUAGE_CONFIG["中文"])
+
+    # grid 接口在 kns.cnki.net 域下：先导航过去建立同源上下文，保证相对路径 fetch 生效
+    try:
+        if "kns.cnki.net" not in page.url:
+            await page.goto("https://kns.cnki.net/", wait_until="domcontentloaded", timeout=30_000)
+            await asyncio.sleep(random.uniform(1, 2))
+    except Exception as e:
+        raise SearchError(f"导航到检索服务失败: {e}") from e
+
+    qgroups = [{"Key": "Subject", "Title": "", "Logic": 0,
+                "Items": [{"Field": field, "Value": query,
+                           "Operator": "TOPRANK" if field == "SU" else "DEFAULT",
+                           "Logic": 0, "Title": search_type}],
+                "ChildItems": []}]
+    if year_from or year_to:
+        qgroups[0]["Items"].append({
+            "Field": "PT", "Value": str(year_from or ""), "Value2": str(year_to or ""),
+            "Operator": "BETWEEN", "Logic": 0, "Title": "发表时间"})
+    qj = {
+        "Platform": "", "Resource": "CROSSDB", "Classid": "WD0FTY92",
+        "Products": lang_cfg["products"],
+        "QNode": {"QGroup": qgroups},
+        "ExScope": 1, "SimpTrad": "0", "SearchType": 2, "Rlang": lang_cfg["rlang"],
+        "Expands": {}, "KuaKuCode": CROSSIDS,
+        "View": "changeDBCh", "SearchFrom": 5,
+    }
+    sort_field = SORT_TYPES.get(sort, "FFD")
+    form = {
+        "boolSearch": "false",
+        "QueryJson": json.dumps(qj, ensure_ascii=False),
+        "pageNum": "1", "pageSize": str(pages * 20),
+        "sortField": sort_field, "sortType": "desc",
+        "dstyle": "listmode", "boolSortSearch": "false",
+        "productStr": "", "aside": "",
+    }
+    js = """async (form) => {
+        const fd = new URLSearchParams();
+        for (const k in form) fd.append(k, form[k]);
+        const r = await fetch('/kns8s/brief/grid', {
+            method: 'POST', body: fd,
+            headers: {'X-Requested-With': 'XMLHttpRequest'}
+        });
+        return await r.text();
+    }"""
+    body = await page.evaluate(js, form)
+    if not body or len(body) < 200:
+        raise SearchError("grid 检索返回空响应，可能触发反爬拦截，请稍后重试")
+    if "/verify/" in body:
+        raise SearchError("CNKI 触发了安全验证（滑块），请稍后重试或手动完成验证")
+
+    papers: list[dict[str, Any]] = []
+    rows = re.findall(r"<tr[^>]*>(.*?)</tr>", body, re.S)
+    for row_html in rows:
+        paper = parse_paper_row_html(f"<tr>{row_html}</tr>")
+        if paper.get("title"):
+            papers.append(paper)
+    return papers
+
+
+def _cell(row: str, cls: str) -> str:
+    """grid 返回行中提取指定 class 单元格文本（兼容 gxlib 解析结构）"""
+    m = re.search(r'<td[^>]*class=["\']' + cls + r'["\'][^>]*>(.*?)</td>', row, re.S)
+    if not m:
+        return ""
+    txt = re.sub(r"<!--.*?-->", "", m.group(1), flags=re.S)
+    return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", "", txt)).strip()
 
 
 async def _check_cnki_accessible(page: Page) -> None:
@@ -148,15 +255,17 @@ async def search_cnki_impl(
     year_from: int | None = None,
     year_to: int | None = None,
     journals: list[str] | None = None,
+    language: str = "中文",
 ) -> dict[str, Any]:
     """执行 CNKI 搜索并返回结果列表
 
     year_from/year_to: 按日期列年份做结果侧过滤（取不到年份的论文保留）。
     journals: 期刊名单过滤（大小写不敏感，子串匹配）。
+    language: 中文(默认)/外文。外文走 grid API（Rlang=FOREIGN），英文文献。
     """
     resolved_type = resolve_search_type(search_type)
     resolved_sort = resolve_sort_type(sort)
-    all_papers: list[dict[str, Any]] = []
+    resolved_lang = resolve_language(language)
 
     async def _captcha_result() -> dict[str, Any]:
         logger.warning("搜索触发验证码: %s", query)
@@ -173,6 +282,35 @@ async def search_cnki_impl(
         }
 
     await _goto_home_with_retry(page)
+
+    # 外文检索：公开站 UI 无外文入口，走 grid API 直调
+    if resolved_lang != "中文":
+        try:
+            all_papers = await _search_via_api(
+                page, query, resolved_type, resolved_lang,
+                year_from=year_from, year_to=year_to,
+                sort=resolved_sort, pages=pages,
+            )
+        except SearchError as e:
+            return {"isError": True, "error": str(e), "error_type": "SearchError",
+                    "query": query, "papers": []}
+        if journals:
+            before = len(all_papers)
+            all_papers = filter_papers(all_papers, journal_names=journals)
+            if len(all_papers) < before:
+                logger.info("结果侧过滤: %d -> %d 篇", before, len(all_papers))
+        return {
+            "query": query,
+            "search_type": resolved_type,
+            "sort": resolved_sort,
+            "language": resolved_lang,
+            "total_pages": pages,
+            "total_papers": len(all_papers),
+            "papers": all_papers,
+            "filters": {"year_from": year_from, "year_to": year_to, "journals": journals or []},
+        }
+
+    all_papers: list[dict[str, Any]] = []
 
     if resolved_type != "主题":
         await select_search_type(page, resolved_type)
@@ -236,6 +374,7 @@ async def search_cnki_impl(
         "query": query,
         "search_type": resolved_type,
         "sort": resolved_sort,
+        "language": resolved_lang,
         "total_pages": pages,
         "total_papers": len(all_papers),
         "papers": all_papers,

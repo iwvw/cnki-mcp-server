@@ -29,6 +29,7 @@ from cnki_mcp.exceptions import CitationError, CNKIError, ExportError
 from cnki_mcp.export import export_papers_impl
 from cnki_mcp.journals import list_categories_impl, recent_articles_impl, search_journals_impl
 from cnki_mcp.match import find_best_match_impl
+from cnki_mcp.references import get_citations_impl, get_references_impl
 from cnki_mcp.search import search_cnki_impl
 
 
@@ -136,9 +137,12 @@ async def search_cnki(
     journals: Annotated[list[str] | None, Field(
         description="期刊名单过滤（大小写不敏感，子串匹配），可选",
     )] = None,
+    language: Annotated[str, Field(
+        description="检索语言: 中文(默认)/外文（英文文献，走 grid API）",
+    )] = "中文",
 ) -> dict:
     """
-    搜索 CNKI 论文，返回论文列表（可按年份区间与期刊名单过滤）。
+    搜索 CNKI 论文，返回论文列表（可按年份区间与期刊名单过滤，支持外文检索）。
 
     Args:
         query: 搜索关键词
@@ -149,11 +153,12 @@ async def search_cnki(
         year_from: 发表年份下限（含）
         year_to: 发表年份上限（含）
         journals: 期刊名单过滤
+        language: 中文/外文（外文检索英文文献）
 
     Returns:
         包含论文列表的字典
     """
-    await ctx.info(f"开始搜索 CNKI: query='{query}', type='{search_type}', sort='{sort}', pages={pages}")
+    await ctx.info(f"开始搜索 CNKI: query='{query}', type='{search_type}', sort='{sort}', lang='{language}', pages={pages}")
     await ctx.report_progress(progress=0, total=100)
 
     pool = _get_pool(ctx)
@@ -161,7 +166,7 @@ async def search_cnki(
     try:
         result = await search_cnki_impl(
             page, query, search_type, pages, sort,
-            year_from=year_from, year_to=year_to, journals=journals,
+            year_from=year_from, year_to=year_to, journals=journals, language=language,
         )
     except CNKIError as e:
         result = {"isError": True, "error": str(e), "error_type": type(e).__name__, "papers": []}
@@ -217,6 +222,95 @@ async def get_paper_detail(
     await ctx.report_progress(progress=100, total=100)
     if not result.get("isError"):
         await ctx.info(f"获取详情成功: {result.get('title', '')[:50]}")
+    return result
+
+
+@mcp.tool()
+async def get_references(
+    url: Annotated[str, Field(description="CNKI 论文详情页 URL（通常从 search_cnki 结果中获取）")],
+    ctx: Context,
+) -> dict:
+    """
+    获取论文的参考文献列表（这篇论文引用了哪些文献）。
+
+    用于文献综述的「滚雪球」式向前追溯：从一篇核心文献出发，
+    顺藤摸瓜找到它引用的全部早期文献。
+
+    Args:
+        url: CNKI 论文详情页 URL
+        ctx: MCP 上下文（自动注入）
+
+    Returns:
+        {"kind": "参考文献", "items": [{序号, 题名, 作者, 来源, 年份}], "total": n}
+    """
+    if not url or not url.strip():
+        return {"isError": True, "error": "URL 不能为空", "error_type": "ValidationError"}
+    if "cnki" not in url.lower():
+        return {"isError": True, "error": "URL 必须是 CNKI 链接", "error_type": "ValidationError"}
+
+    await ctx.info(f"获取参考文献列表: {url[:80]}...")
+    await ctx.report_progress(progress=0, total=100)
+
+    pool = _get_pool(ctx)
+    page = await pool.new_page()
+    try:
+        result = await get_references_impl(page, url)
+    except CNKIError as e:
+        result = {"isError": True, "error": str(e), "error_type": type(e).__name__, "url": url}
+        await ctx.error(f"获取参考文献失败: {e}")
+    except Exception as e:
+        result = {"isError": True, "error": str(e), "error_type": "RefError", "url": url}
+        await ctx.error(f"获取参考文献异常: {e}")
+    finally:
+        await page.close()
+
+    await ctx.report_progress(progress=100, total=100)
+    if result.get("total", 0) > 0:
+        await ctx.info(f"参考文献 {result['total']} 条（{result.get('source')}）")
+    return result
+
+
+@mcp.tool()
+async def get_citations(
+    url: Annotated[str, Field(description="CNKI 论文详情页 URL（通常从 search_cnki 结果中获取）")],
+    ctx: Context,
+) -> dict:
+    """
+    获取论文的引证文献列表（哪些论文引用了这篇）。
+
+    用于文献综述的「顺藤摸瓜」式向后追踪：找到所有引用该文献的后续研究。
+
+    Args:
+        url: CNKI 论文详情页 URL
+        ctx: MCP 上下文（自动注入）
+
+    Returns:
+        {"kind": "引证文献", "items": [{序号, 题名, 作者, 来源, 年份}], "total": n}
+    """
+    if not url or not url.strip():
+        return {"isError": True, "error": "URL 不能为空", "error_type": "ValidationError"}
+    if "cnki" not in url.lower():
+        return {"isError": True, "error": "URL 必须是 CNKI 链接", "error_type": "ValidationError"}
+
+    await ctx.info(f"获取引证文献列表: {url[:80]}...")
+    await ctx.report_progress(progress=0, total=100)
+
+    pool = _get_pool(ctx)
+    page = await pool.new_page()
+    try:
+        result = await get_citations_impl(page, url)
+    except CNKIError as e:
+        result = {"isError": True, "error": str(e), "error_type": type(e).__name__, "url": url}
+        await ctx.error(f"获取引证文献失败: {e}")
+    except Exception as e:
+        result = {"isError": True, "error": str(e), "error_type": "CiteError", "url": url}
+        await ctx.error(f"获取引证文献异常: {e}")
+    finally:
+        await page.close()
+
+    await ctx.report_progress(progress=100, total=100)
+    if result.get("total", 0) > 0:
+        await ctx.info(f"引证文献 {result['total']} 条（{result.get('source')}）")
     return result
 
 

@@ -9,8 +9,10 @@
 
 | 工具 | 说明 | 需要浏览器 |
 |------|------|-----------|
-| `search_cnki` | 搜索 CNKI 论文，支持多页、多种搜索类型和排序 | 是 |
+| `search_cnki` | 搜索 CNKI 论文，支持多页、多种搜索类型和排序、年份/期刊过滤、**外文文献检索** | 是 |
 | `get_paper_detail` | 获取论文详情（标题、摘要、作者、关键词、DOI 等 17 字段） | 是 |
+| `get_references` | 获取论文的**参考文献列表**（这篇引用了哪些，综述滚雪球向前追溯） | 是 |
+| `get_citations` | 获取论文的**引证文献列表**（哪些引用了这篇，追踪后续研究） | 是 |
 | `find_best_match` | 快速匹配论文标题，验证引用信息 | 是 |
 | `format_citation` | 引文格式化（GB/T 7714, APA, MLA, Chicago, Vancouver） | 否 |
 | `browse_journals` | 期刊浏览（学科分类、期刊搜索、最新文章） | 是 |
@@ -30,6 +32,25 @@
 
 - `year_from` / `year_to`: 发表年份区间（含边界），对结果列表的日期列提取年份；提取不到年份的论文保留。
 - `journals`: 期刊名单过滤，大小写不敏感、子串匹配（传「管理世界」可匹配「管理世界(半月刊)」）。
+
+### 外文文献检索（v0.4.0 新增）
+
+`search_cnki` 增加 `language` 参数（中文/外文）：
+
+- 中文（默认）：走公开站 UI 搜索路径。
+- 外文：公开站首页没有外文入口，但底层 `POST /kns8s/brief/grid` 接口支持
+  `Rlang=FOREIGN` + `SCSF` products——检索经页面上下文 fetch 直调该接口
+  （同源、带完整会话 cookie），可检索英文文献题录。
+
+示例：`search_cnki(query="consumer purchase intention", language="外文", sort="被引")`
+
+### 参考文献 / 引证文献（v0.4.0 新增）
+
+- `get_references(url)`: 这篇论文引用了哪些文献——从核心文献出发向前滚雪球。
+- `get_citations(url)`: 哪些论文引用了这篇——向后追踪后续研究。
+
+两者先尝试调用详情页的异步列表接口（`page.evaluate` fetch），失败时回退到
+点击页面 tab 解析 DOM。返回 `[{序号, 题名, 作者, 来源, 年份}]`。
 
 ## 安装
 
