@@ -47,6 +47,8 @@ def main() -> None:
     """CLI 入口"""
     args = sys.argv[1:]
     if args and args[0] == "trust":
+        # trust 模式必须有头：用户需要看到浏览器窗口手动过滑块
+        os.environ["CNKI_HEADLESS"] = "0"
         sys.exit(asyncio.run(_trust_main()))
 
     # MCP 模式：支持 --headed 透传给浏览器池（调试用）
