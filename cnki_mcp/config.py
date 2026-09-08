@@ -7,6 +7,8 @@ CNKI 前端变更时只需修改此文件。
 最后 CNKI 前端验证日期: 2025-05-25
 """
 
+import os
+
 # ============ URL ============
 
 CNKI_HOME_URL = "https://www.cnki.net/"
@@ -108,6 +110,14 @@ BROWSER_TIMEOUT = 30_000  # 30秒总超时 (ms)
 NAVIGATION_TIMEOUT = 60_000  # 60秒导航超时 (ms)
 IDLE_TIMEOUT = 600  # 10分钟空闲关闭 (秒)
 HUMAN_TYPING_DELAY = (0.02, 0.06)  # 字符输入间隔范围 (秒)
+
+# 信任状态持久化文件：保存浏览器池的 cookie/localStorage，
+# MCP 重启后加载回来，避免「新会话无信任 cookie → 搜索触发滑块」。
+# 可用环境变量 CNKI_STATE_FILE 覆盖。
+TRUST_STATE_FILE = os.path.join(
+    os.path.expanduser("~"),
+    os.environ.get("CNKI_STATE_FILE", ".cnki_mcp_state.json"),
+)
 
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",

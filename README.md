@@ -338,6 +338,26 @@ server: TencentEdgeOne
 2. 更换代理 IP 或使用住宅 IP
 3. 确保运行环境能够正常访问 `https://www.cnki.net/`
 
+### 搜索总是触发滑块验证（安全验证）
+
+```
+CNKI 触发了验证码（安全验证），请稍后再试
+```
+
+**原因**: CNKI 对「新会话 + 无信任 cookie + 搜索动作」触发滑块。MCP 进程重启后浏览器
+context 是全新的（cookie 清空），首次搜索大概率触发；不是 IP 被拉黑，也不是代码问题。
+
+**解决方法（信任状态持久化，v0.4.1 新增）**:
+浏览器池会把信任 cookie 保存到 `~/.cnki_mcp_state.json`（可用 `CNKI_STATE_FILE` 覆盖），
+重启后自动加载，不再触发滑块。首次建立信任态：
+
+```bash
+python -m cnki_mcp trust
+```
+
+会打开有头浏览器访问 CNKI，手动完成滑块验证后回到终端按回车，信任状态即被保存。
+之后正常重启 MCP server 即可复用。
+
 ### 搜索框找不到（#txt_SearchText 超时）
 
 ```

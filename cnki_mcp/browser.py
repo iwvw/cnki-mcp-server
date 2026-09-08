@@ -10,6 +10,7 @@ AsyncPlaywright 浏览器池管理。
 """
 
 import asyncio
+import json
 import os
 import random
 import subprocess
@@ -22,9 +23,12 @@ from cnki_mcp.config import (
     BROWSER_TIMEOUT,
     IDLE_TIMEOUT,
     NAVIGATION_TIMEOUT,
+    TRUST_STATE_FILE,
     USER_AGENTS,
 )
 from cnki_mcp.exceptions import BrowserError
+
+_HEADLESS = os.environ.get("CNKI_HEADLESS", "1").lower() not in ("0", "false", "no")
 
 # 弹窗/遮罩关闭选择器（与 utils.dismiss_popups 保持一致）
 dismiss_selectors = [
@@ -120,7 +124,7 @@ class AsyncBrowserPool:
             try:
                 self._playwright = await async_playwright().start()
                 self._browser = await self._playwright.chromium.launch(
-                    headless=True,
+                    headless=_HEADLESS,
                     proxy=proxy,
                     args=chromium_args,
                 )
@@ -129,7 +133,7 @@ class AsyncBrowserPool:
                     await self._install_browser()
                     self._playwright = await async_playwright().start()
                     self._browser = await self._playwright.chromium.launch(
-                        headless=True,
+                        headless=_HEADLESS,
                         proxy=proxy,
                         args=chromium_args,
                     )
@@ -139,12 +143,14 @@ class AsyncBrowserPool:
             if self._browser is None:
                 raise BrowserError("浏览器启动失败")
 
-            # 创建共享的 BrowserContext
+            # 创建共享的 BrowserContext；若已有信任状态文件则加载（重启不丢 cookie）
+            storage_state = TRUST_STATE_FILE if os.path.exists(TRUST_STATE_FILE) else None
             self._context = await self._browser.new_context(
                 user_agent=random.choice(USER_AGENTS),
                 viewport={"width": 1920, "height": 1080},
                 locale="zh-CN",
                 proxy=proxy,
+                storage_state=storage_state,
             )
             await self._context.add_init_script("""
                 Object.defineProperty(navigator, 'webdriver', {
@@ -219,8 +225,16 @@ class AsyncBrowserPool:
         return False
 
     async def _close_browser(self) -> None:
-        """关闭浏览器实例和上下文"""
+        """关闭浏览器实例和上下文（关闭前保存信任状态）"""
         if self._context:
+            try:
+                # 保存 cookie/localStorage，供下次启动复用（避免滑块）
+                state = await self._context.storage_state()
+                if state.get("cookies"):
+                    with open(TRUST_STATE_FILE, "w", encoding="utf-8") as f:
+                        json.dump(state, f, ensure_ascii=False)
+            except Exception:
+                pass
             try:
                 await self._context.close()
             except Exception:
@@ -238,6 +252,16 @@ class AsyncBrowserPool:
             except Exception:
                 pass
             self._playwright = None
+
+    async def save_trust_state(self) -> str:
+        """手动保存当前 context 的信任状态，返回文件路径"""
+        async with self._lock:
+            await self._ensure_browser()
+        assert self._context is not None
+        state = await self._context.storage_state()
+        with open(TRUST_STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False)
+        return TRUST_STATE_FILE
 
     async def close(self) -> None:
         """关闭浏览器池"""
