@@ -140,6 +140,9 @@ async def search_cnki(
     language: Annotated[str, Field(
         description="检索语言: 中文(默认)/外文（英文文献，走 grid API）",
     )] = "中文",
+    fetch_citation: Annotated[bool, Field(
+        description="是否通过引文 API 抓取每篇文献的 GB/T 7714 引文（含卷期页码/DOI，网络首发为预排版页码）；默认 True。失败不阻塞搜索",
+    )] = True,
 ) -> dict:
     """
     搜索 CNKI 论文，返回论文列表（可按年份区间与期刊名单过滤，支持外文检索）。
@@ -167,6 +170,7 @@ async def search_cnki(
         result = await search_cnki_impl(
             page, query, search_type, pages, sort,
             year_from=year_from, year_to=year_to, journals=journals, language=language,
+            fetch_citation=fetch_citation,
         )
     except CNKIError as e:
         result = {"isError": True, "error": str(e), "error_type": type(e).__name__, "papers": []}

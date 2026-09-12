@@ -243,7 +243,70 @@ async def parse_paper_row_async(row) -> dict[str, Any]:
     except Exception:
         return {"title": "", "url": "", "authors": [], "source": "",
                 "date": "", "cited_count": "0", "download_count": "0"}
-    return parse_paper_row_html(html)
+    paper = parse_paper_row_html(html)
+    # 引文 API 的 filename（2026-09-12 实测：在 td.seq 的 .cbItem checkbox value 里，
+    # 搜索页"引用"按钮用同一接口拿 GB/T 7714 引文，含卷期页码/DOI）
+    try:
+        cb = row.locator("td.seq .cbItem").first
+        if await cb.count() > 0:
+            paper["filename"] = (await cb.get_attribute("value")) or ""
+        else:
+            paper["filename"] = ""
+    except Exception:
+        paper["filename"] = ""
+    return paper
+
+
+async def _fetch_gb_citation(page: Page, filename: str, quote_url: str, uniplatform: str) -> dict[str, Any]:
+    """调 CNKI 引文 API（/dm8/API/GetExport）拿 GB/T 7714 引文，返回 {citation, pages, doi}。
+
+    2026-09-12 实测：搜索页"引用"按钮调同一接口（displaymode=GBTREFER,MLA,APA），
+    GB/T 7714 引文含卷期页码（网络首发文献为预排版页码+引用日期+DOI），
+    比进详情页解析更稳、且绕开详情页验证码。失败返回 None（不阻塞搜索结果）。
+    """
+    try:
+        payload = await page.evaluate(
+            """async ({u, id, uni}) => {
+                const r = await fetch(u, {method: "POST",
+                    headers: {"Content-Type": "application/x-www-form-urlencoded"},
+                    body: new URLSearchParams({filename: id,
+                        displaymode: "GBTREFER,MLA,APA", uniplatform: uni,
+                        subject: "", language: "CHS"}),
+                    credentials: "include"});
+                const j = await r.json();
+                return j;
+            }""",
+            {"u": quote_url, "id": filename, "uni": uniplatform},
+        )
+        if not payload or payload.get("code") != 1:
+            return None
+        for o in payload.get("data") or []:
+            key = o.get("key") or ""
+            if not key.startswith("GB/T"):
+                continue
+            val = "".join(o.get("value") or [])
+            cite = re.sub(r"<br\s*/?>", "", val)
+            cite = re.sub(r"<[^>]+>", "", cite)
+            cite = re.sub(r"^\[\d+\]\s*", "", cite).strip()
+            if not cite:
+                return None
+            # 页码：优先冒号分隔（期刊 "...,61(14):1915-1921."）；
+            # 无冒号时逗号分隔且仅接受 1-3 位页码/页码范围（网络首发 "...,1-14[2026-09-11]."），
+            # 排除学位论文/图书引文中的 4 位年份（[D].学校,2025. → pages 应为空）
+            m_page = (
+                re.search(r"(?<!DOI)[:：]\s*([\d\-+]+)(?=\[|\.|$)", cite)
+                or re.search(r"[,，]\s*(\d{1,3}(?:[-+]\d{1,3})*)(?=\[|\.|$)", cite)
+            )
+            # DOI
+            m_doi = re.search(r"(?:https?://doi\.org/|DOI[:：]?\s*)(10\.\S+)", cite)
+            return {
+                "citation": cite,
+                "pages": m_page.group(1) if m_page else "",
+                "doi": (m_doi.group(1).rstrip(".") if m_doi else ""),
+            }
+        return None
+    except Exception:
+        return None
 
 
 async def search_cnki_impl(
@@ -256,6 +319,7 @@ async def search_cnki_impl(
     year_to: int | None = None,
     journals: list[str] | None = None,
     language: str = "中文",
+    fetch_citation: bool = True,
 ) -> dict[str, Any]:
     """执行 CNKI 搜索并返回结果列表
 
@@ -329,6 +393,17 @@ async def search_cnki_impl(
     if resolved_sort != "相关度":
         await apply_sort(page, resolved_sort)
 
+    # 引文 API 地址（搜索结果页隐藏字段，2026-09-12 实测）
+    quote_url = ""
+    try:
+        quote_el = page.locator("#hidQuoteUrl")
+        if await quote_el.count() > 0:
+            quote_url = (await quote_el.get_attribute("value")) or ""
+    except Exception:
+        quote_url = ""
+    uniplatform = "NZKPT"
+    citation_ok, citation_fail = 0, 0
+
     for page_num in range(1, pages + 1):
         try:
             await page.wait_for_selector(SELECTOR_RESULT_ROWS, timeout=15_000)
@@ -339,7 +414,19 @@ async def search_cnki_impl(
                     row = rows.nth(i)
                     paper = await parse_paper_row_async(row)
                     if paper.get("title"):
-                        paper["page"] = page_num
+                        # 注意：CNKI 搜索结果列表没有卷期页码列，此字段是搜索结果的分页号（第几页结果），
+                        # 不是文献页码范围；卷期页码通过引文 API 或 get_paper_detail 获取
+                        paper["result_page"] = page_num
+                        if fetch_citation and paper.get("filename") and quote_url:
+                            cite = await _fetch_gb_citation(page, paper["filename"], quote_url, uniplatform)
+                            if cite:
+                                paper["citation"] = cite["citation"]
+                                paper["pages"] = cite["pages"]
+                                paper["doi"] = cite["doi"]
+                                citation_ok += 1
+                            else:
+                                citation_fail += 1
+                        paper.pop("filename", None)  # filename 是内部引文参数，不暴露给调用方
                         all_papers.append(paper)
                 except Exception:
                     pass  # 单行解析失败不影响其他行
@@ -377,6 +464,8 @@ async def search_cnki_impl(
         "language": resolved_lang,
         "total_pages": pages,
         "total_papers": len(all_papers),
+        "citation_fetched": citation_ok,
+        "citation_failed": citation_fail,
         "papers": all_papers,
         "filters": {
             "year_from": year_from,

@@ -117,6 +117,8 @@ async def get_paper_detail_impl(page: Page, url: str) -> dict[str, Any]:
         "download_count": "",
         "fund": "",
         "classification": "",
+        "online_pub_time": "",
+        "gb_7714_citation": "",
     }
 
     try:
@@ -203,6 +205,71 @@ async def get_paper_detail_impl(page: Page, url: str) -> dict[str, Any]:
             paper["volume"] = m.group(2) or ""
             paper["issue"] = m.group(3) or ""
             paper["pages"] = m.group(4) or ""
+
+    # 引文 API（2026-09-12 实测）：POST /dm8/API/GetExport 返回 GB/T 7714 等格式。
+    # 官方导出数据最权威，覆盖 year/volume/issue/pages（比解析 top-tip 更准），
+    # 并新增 gb_7714_citation 字段供 GB/T 7714 引文直接使用。
+    # 详情页隐藏字段：#export-url=接口地址，#export-id=filename（"引用"按钮同款）。
+    try:
+        export_url = (await page.locator("#export-url").get_attribute("value")) or ""
+        export_id = (await page.locator("#export-id").get_attribute("value")) or ""
+        if export_url and export_id:
+            from urllib.parse import parse_qs, urlparse
+
+            uni = (parse_qs(urlparse(url).query).get("uniplatform") or ["NZKPT"])[0]
+            payload = await page.evaluate(
+                """async ({u, id, uni}) => {
+                    const r = await fetch(u, {method: "POST",
+                        headers: {"Content-Type": "application/x-www-form-urlencoded"},
+                        body: new URLSearchParams({filename: id,
+                            displaymode: "GBTREFER,elearning,EndNote", uniplatform: uni}),
+                        credentials: "include"});
+                    const j = await r.json();
+                    return j;
+                }""",
+                {"u": export_url, "id": export_id, "uni": uni},
+            )
+            if payload and payload.get("code") == 1:
+                for o in payload.get("data") or []:
+                    key = o.get("key") or ""
+                    val = "".join(o.get("value") or [])
+                    if key.startswith("GB/T"):
+                        cite = re.sub(r"<br\s*/?>", "", val)
+                        cite = re.sub(r"<[^>]+>", "", cite)
+                        cite = re.sub(r"^\[\d+\]\s*", "", cite).strip()
+                        if cite:
+                            paper["gb_7714_citation"] = cite
+                    if "Year-年:" in val:
+                        # <br> 先替换为换行，避免 \S+ 把 <br> 和后续字段一起吃进匹配
+                        val_clean = re.sub(r"<br\s*/?>", "\n", val)
+                        m_year = re.search(r"Year-年:\s*(\d{4})", val_clean)
+                        m_roll = re.search(r"Roll-卷:\s*([^\s]+)", val_clean)
+                        m_period = re.search(r"Period-期:\s*([^\s]+)", val_clean)
+                        m_page = re.search(r"Page-页码:\s*([^\s]+)", val_clean)
+                        if m_year:
+                            paper["year"] = m_year.group(1)
+                        if m_roll:
+                            paper["volume"] = m_roll.group(1)
+                        if m_period:
+                            paper["issue"] = m_period.group(1)
+                        if m_page:
+                            paper["pages"] = m_page.group(1)
+    except Exception:
+        pass
+
+    # 在线公开时间（新版 li.top-space；网络首发文献无卷期页码时可用于定位）
+    try:
+        lis = page.locator("li.top-space")
+        lcnt = await lis.count()
+        for i in range(lcnt):
+            text = _clean_text(await lis.nth(i).text_content())
+            if "在线公开时间" in text:
+                paper["online_pub_time"] = re.sub(
+                    r"（.*?）", "", re.sub(r"^.*?[:：]\s*", "", text)
+                ).strip()
+                break
+    except Exception:
+        pass
 
     # DOI
     doi = ""
